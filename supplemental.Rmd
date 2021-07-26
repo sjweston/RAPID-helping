@@ -1,0 +1,268 @@
+---
+title: "RAPID Helping"
+author: "Sara Weston"
+date: "7/26/2021"
+output: 
+  pdf_document:
+    toc: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+\newpage
+
+# Workspace
+
+## Packages 
+
+```{r}
+library(here)
+library(tidyverse)
+library(stm)
+library(tidytext)
+library(rio)
+library(furrr)
+library(lubridate)
+```
+
+## Data
+
+Here we load the raw data file. 
+
+```{r, eval = F}
+master = import(here("data/MasterFile_groupings.sav"))
+```
+
+We select only those variables to be used in these analyses. 
+
+```{r, eval = F}
+master = master %>%
+  select(CaregiverID,             # id variable
+         UserLanguage,            # language
+         StartDate,               # date
+         starts_with("DEMO.007"), # race
+         GAD2.002.a, GAD2.002.b,  # anxiety
+         PHQ.002.a, PHQ.002.b,    # depression
+         STRESS.002,              # stress
+         LONE.001.b,              # loneliness
+         CBCL.002.a,              # child fussiness
+         CBCL.002.b,              # child fearfulness
+         FPL.150,                 # below 1.5 x Federal poverty level?
+         OPEN.002                 # response to open-ended Q
+         )
+
+save(master, file = here("data/master_subset.Rdata"))
+```
+
+```{r}
+load(here("data/master_subset.Rdata"))
+```
+
+# Cleaning
+
+## Recode and rename variables.
+
+First, we recode the race variables into a single categorical variable.
+
+```{r}
+master = master %>%
+  mutate(
+    race = case_when(
+      DEMO.007_3 == 1 ~ "Black",
+      DEMO.007_5 == 1 ~ "White",
+      DEMO.007_1 == 1 ~ "Other",
+      DEMO.007_2 == 1 ~ "Other",
+      DEMO.007_4 == 1 ~ "Other",
+      DEMO.007_6 == 1 ~ "Other",
+      TRUE ~ NA_character_))
+```
+
+We rename single items to better communicate the construct assessed.
+
+```{r}
+master = master %>%
+  rename(
+    stress = STRESS.002,
+    lonely = LONE.001.b,
+    child_fussy = CBCL.002.a, 
+    child_fearful = CBCL.002.b,
+    poverty = FPL.150)
+```
+
+We use the date variable to create two new variables, one which indicates the number of months since the pandemic started (for analysis purposes) and the other which changes the class to a Date format. 
+
+```{r}
+master = master %>%
+  mutate(Date = as.Date(StartDate)) %>% 
+  mutate(month = interval(as.Date("2020-03-13"), Date),
+         month = month %/% months(1)) 
+```
+
+For each caregiver, we also create a variable to indicate which response this row is (i.e., their first, 1; second, 2; third, 3; etc).
+
+```{r}
+master = master %>%
+  group_by(CaregiverID) %>% 
+  mutate(response = row_number()) %>% 
+  ungroup()
+```
+
+We create a "postid" which combines the caregiver id variable with the response variable to create a unique id for each specific observation.
+
+```{r}
+master = master %>% 
+  mutate(obs_id = paste(CaregiverID, response, sep = "_"))
+```
+
+
+
+## Score parental mental health variables
+
+Next we calculate parental anxiety and depression by taking the averages of the two items assessed. 
+
+```{r}
+master$anxiety = rowMeans(master[,c("GAD2.002.a", "GAD2.002.b")], na.rm = T)
+master$depression = rowMeans(master[,c("PHQ.002.a", "PHQ.002.b")], na.rm = T)  
+```
+
+## Extend demographics
+
+Some variables were only assessed the first time a parent entered the survey. This includes race and financial status. To ensure these responses are appropriately tied to questions assessed weekly -- including the open-ended questions -- we use the `fill` function to carry forward variables.
+
+```{r}
+master = master %>%
+    fill(race, poverty, .direction = "downup")
+```
+
+## Well-being composite
+
+We standardize the mental health variables to the sample at hand.
+
+```{r}
+master = master %>%
+  mutate(across(c(anxiety, depression, stress, lonely, 
+                  child_fussy, child_fearful),
+                .fns = list(z = scale))) 
+```
+
+Next, we calculate for each observation the average standardized response these questions. We multiply this average by -1, so that higher scores indicate better well-being.
+
+```{r}
+master = master %>%
+  rowwise %>%
+  mutate(parent_wellbeing = mean(c_across(anxiety_z:lonely_z), na.rm=T)*-1,
+         child_wellbeing = mean(c_across(child_fussy_z:child_fearful_z), na.rm=T)*-1) %>%
+  ungroup()
+```
+
+## Clean open-ended
+
+```{r}
+master = master %>%
+  mutate(OPEN.002 = str_replace(OPEN.002, "\n", " ")) %>% 
+  filter(!(OPEN.002 %in% c("N/A","N/A.", "N/a","N/a.", "n/a","n/a.",
+                           "None", "NA", "none", "Na", "no", "nope")))
+```
+
+## Filter responses
+
+We select only responses which have valid responses to the open-ended question and for which the participant completed the questionnaire in English. 
+
+```{r}
+master = master %>%
+  filter(!is.na(OPEN.002)) %>% 
+  filter(OPEN.002 != "") %>% 
+    filter(UserLanguage == "EN") 
+
+nrow(master)
+```
+
+Analyses also require full information, so we remove participants missing on the well-being variables.
+
+```{r}
+master = master %>%
+  filter(!is.na(child_wellbeing)) %>%
+  filter(!is.na(parent_wellbeing))
+
+nrow(master)
+```
+
+Finally, we select only the variables of interest to us.
+
+```{r}
+data = master %>%
+  select(CaregiverID, obs_id, Date, month, OPEN.002, 
+         parent_wellbeing, child_wellbeing, race, poverty,
+         stress, lonely, child_fussy, child_fearful, poverty)
+rm(master)
+```
+
+
+```{r, echo = F}
+save(data, file = here("data/cleaned.Rdata"))
+```
+
+## Prepare for topic modeling
+
+```{r, echo = F}
+load(here("data/cleaned.Rdata"))
+```
+
+We create a tidied version of the data frame that extracts distinct words. In other words, each word in each response will receive its own row in the data.
+
+```{r}
+tidy_data <- data %>%
+  unnest_tokens(word, OPEN.002, token = "words") 
+```
+
+Next, we remove stop words and numbers.
+
+```{r} 
+tidy_data = tidy_data %>%
+  anti_join(get_stopwords()) %>%
+  filter(!str_detect(word, "[0-9]+")) 
+```
+
+We count the number of times each word was used in the dataset. We filter out words with fewer than 20 uses.
+
+```{r} 
+tidy_data = tidy_data %>%
+  add_count(word) %>%
+  filter(n > 20) %>%
+  select(-n)
+```
+
+For each unique observation (i.e., each parent at each time point), we create single row. Each unqiue word has its own column and the cells indicate how often the caregiver used the word that time. 
+
+```{r}
+data_sparse <- tidy_data %>%
+  count(obs_id, word) %>%
+  cast_sparse(obs_id, word, n)
+```
+
+Some responses may have been lost, if they used only words that were present less than 20 times in the entire data. To ensure our metadata match the new data frame, we compare the observation ids.
+
+```{r}
+open_meta = data %>%
+  filter(obs_id %in% c(data_sparse@Dimnames[[1]]))
+rownames(open_meta) = open_meta$obs_id
+```
+
+\newpage 
+
+# How many topics?
+
+A primary challenge in topic modeling is identifying the correct number of topics to extract. We look at many solutions here, ranging from as few as 5 to as many as 100.
+
+```{r}
+plan(multiprocess)
+
+many_models <- data_frame(K = c(5, 10, 20, 30, 40, 50, 60, 70, 80, 100)) %>%
+  mutate(topic_model = future_map(K, ~stm(open_sparse, K = .,
+                                          verbose = FALSE)))
+```
+
+
+
